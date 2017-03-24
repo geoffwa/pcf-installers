@@ -47,15 +47,12 @@ echo -n "getting SSL cert ARN for region $REGION..."
 SSLCertificateARN=`aws --region "$REGION" iam list-server-certificates | jq -r '.ServerCertificateMetadataList[0].Arn'`
 echo "FOUND ${SSLCertificateARN}"
 
-RdsUsername="iamthebestopsmanager"
-RdsPassword="iamthebestopsmanagerpassword"
-
 echo -n "creating PCF deployment in $REGION called $STACK_NAME"
 aws --region "$REGION" cloudformation create-stack \
   --stack-name "$STACK_NAME" \
   --template-body file://"$PCF_CLOUDFORMATION_FILE" \
   --capabilities CAPABILITY_NAMED_IAM CAPABILITY_IAM \
   --parameters "ParameterKey=01NATKeyPair,ParameterValue=$NATKeyPair" \
-  "ParameterKey=05RdsUsername,ParameterValue=$RdsUsername" \
-  "ParameterKey=06RdsPassword,ParameterValue=$RdsPassword" \
+  "ParameterKey=05RdsUsername,ParameterValue=$RDS_USERNAME" \
+  "ParameterKey=06RdsPassword,ParameterValue=$RDS_PASSWORD" \
   "ParameterKey=07SSLCertificateARN,ParameterValue=$SSLCertificateARN"
