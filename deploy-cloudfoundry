@@ -1,0 +1,61 @@
+#!/bin/bash
+
+set -o errexit
+
+die() {
+  echo "ERROR: $@" >&2
+  exit 1
+}
+
+which curl >/dev/null || die "couldn't find curl on \$PATH"
+which aws >/dev/null || die "couldn't find aws on \$PATH"
+
+source ./.credentials
+
+[ -n "$PIVNET_TOKEN" ] || die "\$PIVNET_TOKEN empty or not set"
+[ -n "$RDS_USERNAME" ] || die "\$RDS_USERNAME empty or not set"
+[ -n "$RDS_PASSWORD" ] || die "\$RDS_PASSWORD empty or not set"
+
+REGION="us-east-1"
+PCF_SLUG="elastic-runtime"
+STACK_NAME=${1}
+
+AUTH_HEADER="Authorization: Token ${PIVNET_TOKEN}"
+ACCEPT_HEADER="Accept: application/json"
+
+echo -n 'getting elastic runtime releases... '
+PCF_FILES_URL=`curl --location --header "$AUTH_HEADER" --header "$ACCEPT_HEADER" -fsS "https://network.pivotal.io/api/v2/products/${PCF_SLUG}/releases" | \
+jq -r '.releases[0]._links.product_files.href'`
+echo 'FOUND'
+
+echo -n 'getting URL to download latest elastic runtime cloudformation template... '
+PCF_CF_DOWNLOAD_URL=`curl --location --header "$AUTH_HEADER" --header "$ACCEPT_HEADER" -fsS "$PCF_FILES_URL" | \
+jq -r '.product_files[] | select(.aws_object_key | endswith("_cloudformation.json")) | ._links.download.href'`
+echo 'FOUND'
+
+echo -n 'downloading latest elastic runtime cloudformation template...'
+PCF_CLOUDFORMATION_FILE=`mktemp`
+trap "rm -f '$PCF_CLOUDFORMATION_FILE'" EXIT
+curl --location --header "$AUTH_HEADER" --header "$ACCEPT_HEADER" -fsS -o "$PCF_CLOUDFORMATION_FILE" "$PCF_CF_DOWNLOAD_URL"
+echo 'DOWNLOADED'
+
+echo -n "getting keypair for region $REGION..."
+NATKeyPair=`aws --region "$REGION" ec2 describe-key-pairs | jq -r '.KeyPairs[0].KeyName'`
+echo "FOUND ${NATKeyPair}"
+
+echo -n "getting SSL cert ARN for region $REGION..."
+SSLCertificateARN=`aws --region "$REGION" iam list-server-certificates | jq -r '.ServerCertificateMetadataList[0].Arn'`
+echo "FOUND ${SSLCertificateARN}"
+
+RdsUsername="iamthebestopsmanager"
+RdsPassword="iamthebestopsmanagerpassword"
+
+echo -n "creating PCF deployment in $REGION called $STACK_NAME"
+aws --region "$REGION" cloudformation create-stack \
+  --stack-name "$STACK_NAME" \
+  --template-body file://"$PCF_CLOUDFORMATION_FILE" \
+  --capabilities CAPABILITY_NAMED_IAM CAPABILITY_IAM \
+  --parameters "ParameterKey=01NATKeyPair,ParameterValue=$NATKeyPair" \
+  "ParameterKey=05RdsUsername,ParameterValue=$RdsUsername" \
+  "ParameterKey=06RdsPassword,ParameterValue=$RdsPassword" \
+  "ParameterKey=07SSLCertificateARN,ParameterValue=$SSLCertificateARN"
