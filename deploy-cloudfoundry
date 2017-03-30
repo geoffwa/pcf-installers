@@ -1,58 +1,202 @@
-#!/bin/bash
+#!/usr/bin/env ruby
 
-set -o errexit
+require 'rubygems'
+require 'json'
+require 'net/https'
+require 'uri'
+require 'time'
 
-die() {
-  echo "ERROR: $@" >&2
-  exit 1
-}
 
-which curl >/dev/null || die "couldn't find curl on \$PATH"
-which aws >/dev/null || die "couldn't find aws on \$PATH"
+require 'pry'
+require 'aws-sdk'
+require 'dotenv/load'
+require 'rest-client'
 
-source ./.credentials
+PCF_REGION = ENV.fetch('PCF_REGION', 'us-east-1')
+PCF_PIVNET_SLUG = 'elastic-runtime'
+PIVNET_TOKEN = ENV.fetch('PIVNET_TOKEN')
+RDS_USERNAME = ENV.fetch('RDS_USERNAME')
+RDS_PASSWORD = ENV.fetch('RDS_PASSWORD')
+MOBILE_NUMBER = ENV.fetch('MOBILE_NUMBER', false)
+STACK_NAME = ARGV[0]
 
-[ -n "$PIVNET_TOKEN" ] || die "\$PIVNET_TOKEN empty or not set"
-[ -n "$RDS_USERNAME" ] || die "\$RDS_USERNAME empty or not set"
-[ -n "$RDS_PASSWORD" ] || die "\$RDS_PASSWORD empty or not set"
+def formatted_duration total_seconds
+  hours = total_seconds / (60 * 60)
+  minutes = (total_seconds / 60) % 60
+  seconds = total_seconds % 60
 
-REGION="us-east-1"
-PCF_SLUG="elastic-runtime"
-STACK_NAME=${1}
+  [
+      hours > 0 ? '%02dh' % [hours] : nil,
+      minutes > 0 ? '%02dm' % [minutes] : nil,
+      seconds > 0 ? '%02ds' % [seconds] : nil
+  ].compact.join(' ')
+end
 
-AUTH_HEADER="Authorization: Token ${PIVNET_TOKEN}"
-ACCEPT_HEADER="Accept: application/json"
+def format_stack_event(stack_event)
+  [
+      stack_event.timestamp.localtime.strftime('%H:%M:%S'),
+      stack_event.resource_type,
+      stack_event.logical_resource_id,
+      stack_event.resource_status,
+      stack_event.resource_status_reason
+  ].join(' ')
+end
 
-echo -n 'getting elastic runtime releases... '
-PCF_FILES_URL=`curl --location --header "$AUTH_HEADER" --header "$ACCEPT_HEADER" -fsS "https://network.pivotal.io/api/v2/products/${PCF_SLUG}/releases" | \
-jq -r '.releases[0]._links.product_files.href'`
-echo 'FOUND'
+def fetch_stack_events(cf_client, stack_id, last_event_id)
+  new_events = []
+  next_token = nil
 
-echo -n 'getting URL to download latest elastic runtime cloudformation template... '
-PCF_CF_DOWNLOAD_URL=`curl --location --header "$AUTH_HEADER" --header "$ACCEPT_HEADER" -fsS "$PCF_FILES_URL" | \
-jq -r '.product_files[] | select(.aws_object_key | endswith("_cloudformation.json")) | ._links.download.href'`
-echo 'FOUND'
+  loop do
+    response = cf_client.describe_stack_events(
+        stack_name: stack_id,
+        next_token: next_token
+    )
 
-echo -n 'downloading latest elastic runtime cloudformation template...'
-PCF_CLOUDFORMATION_FILE=`mktemp`
-trap "rm -f '$PCF_CLOUDFORMATION_FILE'" EXIT
-curl --location --header "$AUTH_HEADER" --header "$ACCEPT_HEADER" -fsS -o "$PCF_CLOUDFORMATION_FILE" "$PCF_CF_DOWNLOAD_URL"
-echo 'DOWNLOADED'
+    stack_events = response.stack_events
+    recent_events = last_event_id ? stack_events.take_while { |e| e.event_id != last_event_id } : stack_events
 
-echo -n "getting keypair for region $REGION..."
-NATKeyPair=`aws --region "$REGION" ec2 describe-key-pairs | jq -r '.KeyPairs[0].KeyName'`
-echo "FOUND ${NATKeyPair}"
+    new_events.concat(recent_events)
 
-echo -n "getting SSL cert ARN for region $REGION..."
-SSLCertificateARN=`aws --region "$REGION" iam list-server-certificates | jq -r '.ServerCertificateMetadataList[0].Arn'`
-echo "FOUND ${SSLCertificateARN}"
+    break if recent_events.size != stack_events.size
 
-echo -n "creating PCF deployment in $REGION called $STACK_NAME"
-aws --region "$REGION" cloudformation create-stack \
-  --stack-name "$STACK_NAME" \
-  --template-body file://"$PCF_CLOUDFORMATION_FILE" \
-  --capabilities CAPABILITY_NAMED_IAM CAPABILITY_IAM \
-  --parameters "ParameterKey=01NATKeyPair,ParameterValue=$NATKeyPair" \
-  "ParameterKey=05RdsUsername,ParameterValue=$RDS_USERNAME" \
-  "ParameterKey=06RdsPassword,ParameterValue=$RDS_PASSWORD" \
-  "ParameterKey=07SSLCertificateARN,ParameterValue=$SSLCertificateARN"
+    next_token = response.next_token
+    break if !next_token
+  end
+
+  new_events.reverse
+end
+
+def pivnet_request(url, method: 'GET')
+  request_args = {
+      method: method,
+      url: url,
+      open_timeout: 10,
+      read_timeout: 10,
+      headers: {
+          accept: :json,
+          'Authorization': "Token #{PIVNET_TOKEN}"
+      }
+  }
+
+  RestClient::Request.new(request_args)
+end
+
+require 'pp'
+
+print "fetching PCF releases from pivnet... "
+releases_url = "https://network.pivotal.io/api/v2/products/#{PCF_PIVNET_SLUG}/releases"
+response = pivnet_request(releases_url).execute
+pcf_release = JSON.parse(response.body).fetch('releases').fetch(0)
+puts "found PCF v#{pcf_release.fetch('version')}"
+
+pcf_product_files_url = pcf_release.fetch('_links')
+                            .fetch('product_files')
+                            .fetch('href')
+response = pivnet_request(pcf_product_files_url).execute
+
+print "finding PCF CloudFormation downloads... "
+product_files = JSON.parse(response.body).fetch('product_files')
+product_file = product_files.find { |f| f.fetch('aws_object_key').end_with? '_cloudformation.json' }
+download_url = product_file.fetch('_links')
+                   .fetch('download')
+                   .fetch('href')
+
+cloudformation_template = begin
+  pivnet_request(download_url).execute.body
+rescue RestClient::RequestFailed => e
+  if e.http_code == 451
+    print 'accepting EULA for you... '
+    accept_eula_href = JSON.parse(e.http_body)
+                           .fetch('_links')
+                           .fetch('eula_agreement')
+                           .fetch('href')
+    pivnet_request(accept_eula_href, method: 'POST').execute
+    print 'accepted '
+    pivnet_request(download_url).execute.body
+  else
+    raise e
+  end
+end
+puts "downloaded #{product_file['name']} v#{product_file['file_version']}"
+
+Aws.config.update({region: PCF_REGION})
+
+print "finding SSH keypairs in #{PCF_REGION}... "
+ec2_client = Aws::EC2::Client.new
+key_pair = ec2_client.describe_key_pairs.key_pairs.fetch(0)
+puts "found #{key_pair.key_name}"
+
+print "finding SSL cert ARN in #{PCF_REGION}... "
+iam_client = Aws::IAM::Client.new
+ssl_cert = iam_client.list_server_certificates.server_certificate_metadata_list.fetch(0)
+puts "found #{ssl_cert.arn}"
+
+puts "creating AWS CF stack #{STACK_NAME}... "
+stack_create_start = Time.now
+cf_client = Aws::CloudFormation::Client.new
+response = cf_client.create_stack(
+    {
+        stack_name: STACK_NAME,
+        template_body: cloudformation_template,
+        parameters: [
+            {
+                parameter_key: '01NATKeyPair',
+                parameter_value: key_pair.key_name,
+            },
+            {
+                parameter_key: '05RdsUsername',
+                parameter_value: RDS_USERNAME,
+            },
+            {
+                parameter_key: '06RdsPassword',
+                parameter_value: RDS_PASSWORD,
+            },
+            {
+                parameter_key: '07SSLCertificateARN',
+                parameter_value: ssl_cert.arn,
+            }
+        ],
+        capabilities : %w(CAPABILITY_NAMED_IAM CAPABILITY_IAM)
+    }
+)
+puts "=> creating #{response.stack_id}"
+
+cf_client.wait_until(:stack_create_complete) do |waiter|
+  pcf_last_event_id = nil
+  opsman_last_event_id = nil
+  opsman_stack_id = nil
+
+  waiter.before_wait do |attempts, response|
+    new_events = fetch_stack_events(cf_client, STACK_NAME, pcf_last_event_id)
+    last_event = new_events.last
+    pcf_last_event_id = last_event.event_id if last_event
+
+    new_events.each do |event|
+      puts format_stack_event(event)
+    end
+
+    opsman_stack_event = new_events.find do |e|
+      e.logical_resource_id == 'OpsManStack' &&
+          e.resource_status == 'CREATE_IN_PROGRESS' &&
+          e.resource_status_reason
+    end
+    if opsman_stack_event
+      opsman_stack_id = opsman_stack_event.physical_resource_id
+      puts "OpsManStack is #{opsman_stack_id}"
+      pp opsman_stack_event
+    end
+
+    if opsman_stack_id
+      new_events = fetch_stack_events(cf_client, opsman_stack_id, opsman_last_event_id)
+      last_event = new_events.last
+      opsman_last_event_id = last_event.event_id if last_event
+      new_events.each do |event|
+        puts format_stack_event(event)
+      end
+    end
+  end
+end
+
+stack_create_finish = Time.now
+puts "deployed PCF stack in #{formatted_duration(stack_create_finish - stack_create_start)}"
+
