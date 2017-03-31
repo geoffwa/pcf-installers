@@ -6,13 +6,31 @@ require 'net/https'
 require 'uri'
 require 'time'
 
-
+require 'inifile'
 require 'pry'
 require 'aws-sdk'
 require 'dotenv/load'
 require 'rest-client'
 
-PCF_REGION = ENV.fetch('PCF_REGION', 'us-east-1')
+if File.file? "#{ENV['HOME']}/.aws/config"
+  aws_config = IniFile.new(filename: "#{ENV['HOME']}/.aws/config", encoding: 'UTF-8')
+
+  if aws_config.has_section? 'default'
+    region = aws_config['default']['region'] || 'us-east-1'
+    Aws.config.update({region: region})
+  end
+end
+
+if File.file? "#{ENV['HOME']}/.aws/credentials"
+  aws_creds = IniFile.new(filename: "#{ENV['HOME']}/.aws/credentials", encoding: 'UTF-8')
+
+  if aws_creds.has_section? 'default'
+    access_key = aws_creds['default']['aws_access_key_id'] || raise('no aws_access_key_id configured')
+    secret_key = aws_creds['default']['aws_secret_access_key'] || raise('no aws_secret_access_key configured')
+    Aws.config.update({credentials: Aws::Credentials.new(access_key, secret_key)})
+  end
+end
+
 PCF_PIVNET_SLUG = 'elastic-runtime'
 PIVNET_TOKEN = ENV.fetch('PIVNET_TOKEN')
 RDS_USERNAME = ENV.fetch('RDS_USERNAME')
@@ -119,8 +137,7 @@ rescue RestClient::RequestFailed => e
 end
 puts "downloaded #{product_file['name']} v#{product_file['file_version']}"
 
-Aws.config.update({region: PCF_REGION})
-
+PCF_REGION = Aws.config[:region]
 print "finding SSH keypairs in #{PCF_REGION}... "
 ec2_client = Aws::EC2::Client.new
 key_pair = ec2_client.describe_key_pairs.key_pairs.fetch(0)
