@@ -12,6 +12,7 @@ require 'aws-sdk'
 require 'dotenv/load'
 require 'rest-client'
 require 'terminal-notifier'
+require 'tty-table'
 
 if File.file? "#{ENV['HOME']}/.aws/config"
   aws_config = IniFile.new(filename: "#{ENV['HOME']}/.aws/config", encoding: 'UTF-8')
@@ -38,50 +39,153 @@ RDS_USERNAME = ENV.fetch('RDS_USERNAME')
 RDS_PASSWORD = ENV.fetch('RDS_PASSWORD')
 STACK_NAME = ARGV[0]
 
-def formatted_duration total_seconds
-  hours = total_seconds / (60 * 60)
-  minutes = (total_seconds / 60) % 60
-  seconds = total_seconds % 60
+class Duration
 
-  [
-      hours > 0 ? '%02dh' % [hours] : nil,
-      minutes > 0 ? '%02dm' % [minutes] : nil,
-      seconds > 0 ? '%02ds' % [seconds] : nil
-  ].compact.join(' ')
-end
+  attr_reader :start, :finish
 
-def format_stack_event(stack_event)
-  [
-      stack_event.timestamp.localtime.strftime('%H:%M:%S'),
-      stack_event.resource_type,
-      stack_event.logical_resource_id,
-      stack_event.resource_status,
-      stack_event.resource_status_reason
-  ].join(' ')
-end
-
-def fetch_stack_events(cf_client, stack_id, last_event_id)
-  new_events = []
-  next_token = nil
-
-  loop do
-    response = cf_client.describe_stack_events(
-        stack_name: stack_id,
-        next_token: next_token
-    )
-
-    stack_events = response.stack_events
-    recent_events = last_event_id ? stack_events.take_while { |e| e.event_id != last_event_id } : stack_events
-
-    new_events.concat(recent_events)
-
-    break if recent_events.size != stack_events.size
-
-    next_token = response.next_token
-    break if !next_token
+  def initialize(start=Time.now, finish = nil)
+    @start = start
+    @finish = finish
   end
 
-  new_events.reverse
+  def mark_finished(finish=Time.now)
+    @finish = finish
+  end
+
+  def length
+    (@finish || Time.now) - @start
+  end
+
+  def formatted_length
+    total_seconds = self.length
+
+    hours = total_seconds / (60 * 60)
+    hours = hours.to_i > 0 ? ('%02dh' % [hours]) : nil
+
+    minutes = (total_seconds / 60) % 60
+    minutes = minutes.to_i > 0 ? ('%02dm' % [minutes]) : nil
+
+    seconds = total_seconds % 60
+    seconds = seconds.to_i > 0 ? ('%02ds' % [seconds]) : nil
+
+    [hours, minutes, seconds].compact.join('')
+  end
+end
+
+class StackResource
+
+  DONE = "\u2714"
+  ERROR = "\u2716"
+
+  attr_reader :id, :name, :type, :state, :state_reason, :duration
+
+  def initialize(stack_event)
+    @id = stack_event.physical_resource_id
+    @name = stack_event.logical_resource_id
+    @type = stack_event.resource_type
+    @duration = Duration.new(stack_event.timestamp)
+    @state = stack_event.resource_status
+    @state_reason = stack_event.resource_status_reason
+  end
+
+  def update(stack_event)
+    return false unless matches_event(stack_event)
+
+    @state = stack_event.resource_status
+    @state_reason = stack_event.resource_status_reason
+
+    @duration.mark_finished(stack_event.timestamp) unless deploying?
+    true
+  end
+
+  def formatted_duration
+    duration.formatted_length
+  end
+
+  def state_mark
+    if done?
+      DONE
+    elsif error?
+      ERROR
+    else
+      ''
+    end
+  end
+
+  def done?
+    %w{ CREATE_COMPLETE DELETE_COMPLETE UPDATE_COMPLETE }.include?(@state)
+  end
+
+  def deploying?
+    %w{ CREATE_IN_PROGRESS DELETE_IN_PROGRESS UPDATE_IN_PROGRESS }.include?(@state)
+  end
+
+  def error?
+    %w{ CREATE_FAILED DELETE_FAILED UPDATE_COMPLETE }.include?(@state)
+  end
+
+  def matches_event(stack_event)
+    stack_event.physical_resource_id == id
+  end
+
+  def eql?(object)
+    object.equal?(self) || object.is_a?(self.class) && object.id == id
+  end
+
+  def <=>(resource)
+    return -1 if done? && !resource.done?
+    return 1 if !done? && resource.done?
+
+    [ type, name, id ] <=> [ resource.type, resource.name, resource.id ]
+  end
+
+  alias_method :==, :eql?
+
+  def hash
+    id.hash
+  end
+
+end
+
+class StackEventPoller
+
+  attr_reader :events, :stack_id
+
+  def initialize(stack_id)
+    @events = []
+    @stack_id = stack_id
+  end
+
+  def poll(cf_client)
+    new_events = []
+    next_token = nil
+
+    loop do
+      response = cf_client.describe_stack_events(
+        stack_name: stack_id,
+        next_token: next_token
+      )
+
+      fetched_events = response.stack_events
+
+      new_events.concat(
+        last_event_id ?
+          fetched_events.take_while { |event| event.event_id != last_event_id }.reverse :
+          fetched_events.reverse
+      )
+
+      next_token = response.next_token
+      break if !next_token
+    end
+
+    @events.concat(new_events)
+    new_events
+  end
+
+  def last_event_id
+    @events.empty? ? nil : @events.last.event_id
+  end
+
 end
 
 def pivnet_request(url, method: 'GET')
@@ -149,7 +253,7 @@ ssl_cert = iam_client.list_server_certificates.server_certificate_metadata_list.
 puts "found #{ssl_cert.arn}"
 
 puts "creating AWS CF stack #{STACK_NAME}... "
-stack_create_start = Time.now
+stack_create_duration = Duration.new
 cf_client = Aws::CloudFormation::Client.new
 response = cf_client.create_stack(
     {
@@ -178,45 +282,46 @@ response = cf_client.create_stack(
 )
 puts "=> creating #{response.stack_id}"
 
+pollers = [StackEventPoller.new(STACK_NAME)]
+resources = []
+headers = %w(Type Name Status Duration Notes)
+
 cf_client.wait_until(:stack_create_complete) do |waiter|
-  pcf_last_event_id = nil
-  opsman_last_event_id = nil
-  opsman_stack_id = nil
-
   waiter.before_wait do |attempts, response|
-    new_events = fetch_stack_events(cf_client, STACK_NAME, pcf_last_event_id)
-    last_event = new_events.last
-    pcf_last_event_id = last_event.event_id if last_event
+    pollers.each do |poller|
+      new_events = poller.poll(cf_client)
 
-    new_events.each do |event|
-      puts format_stack_event(event)
-    end
+      new_events.each do |event|
+        if resources.none? { |resource| resource.update(event) }
+          resources << StackResource.new(event)
+        end
+      end
 
-    opsman_stack_event = new_events.find do |e|
-      e.logical_resource_id == 'OpsManStack' &&
+      next unless pollers.length < 2
+
+      opsman_stack_event = new_events.find do |e|
+        e.logical_resource_id == 'OpsManStack' &&
           e.resource_status == 'CREATE_IN_PROGRESS' &&
           e.resource_status_reason
-    end
-    if opsman_stack_event
-      opsman_stack_id = opsman_stack_event.physical_resource_id
-      puts "OpsManStack is #{opsman_stack_id}"
-      pp opsman_stack_event
-    end
+      end
 
-    if opsman_stack_id
-      new_events = fetch_stack_events(cf_client, opsman_stack_id, opsman_last_event_id)
-      last_event = new_events.last
-      opsman_last_event_id = last_event.event_id if last_event
-      new_events.each do |event|
-        puts format_stack_event(event)
+      if opsman_stack_event
+        opsman_stack_id = opsman_stack_event.physical_resource_id
+        pollers << StackEventPoller.new(opsman_stack_id)
       end
     end
+
+    now = Time.now
+    resources = resources.sort_by { |resource| resource.duration.finish || now }
+    rows = resources.map { |r| [ r.type, r.name, r.state_mark, r.formatted_duration, r.state_reason ] }
+
+    table = TTY::Table.new(header: headers, rows: rows)
+    print table.render :unicode, resize: true
   end
 end
 
-stack_create_finish = Time.now
-duration = formatted_duration(stack_create_finish - stack_create_start)
-message = "deployment of #{STACK_NAME} to AWS finished in #{duration}"
+stack_create_duration.mark_finished
+message = "deployment of #{STACK_NAME} to AWS finished in #{stack_create_duration.formatted_length}"
 puts message
 TerminalNotifier.notify(message)
 
