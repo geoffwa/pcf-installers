@@ -190,14 +190,14 @@ end
 
 def pivnet_request(url, method: 'GET')
   request_args = {
-      method: method,
-      url: url,
-      open_timeout: 10,
-      read_timeout: 10,
-      headers: {
-          accept: :json,
-          'Authorization': "Token #{PIVNET_TOKEN}"
-      }
+    method: method,
+    url: url,
+    open_timeout: 10,
+    read_timeout: 10,
+    headers: {
+      accept: :json,
+      'Authorization': "Token #{PIVNET_TOKEN}"
+    }
   }
 
   RestClient::Request.new(request_args)
@@ -212,16 +212,16 @@ pcf_release = JSON.parse(response.body).fetch('releases').fetch(0)
 puts "found PCF v#{pcf_release.fetch('version')}"
 
 pcf_product_files_url = pcf_release.fetch('_links')
-                            .fetch('product_files')
-                            .fetch('href')
+  .fetch('product_files')
+  .fetch('href')
 response = pivnet_request(pcf_product_files_url).execute
 
 print "finding PCF CloudFormation downloads... "
 product_files = JSON.parse(response.body).fetch('product_files')
 product_file = product_files.find { |f| f.fetch('aws_object_key').end_with? '_cloudformation.json' }
 download_url = product_file.fetch('_links')
-                   .fetch('download')
-                   .fetch('href')
+  .fetch('download')
+  .fetch('href')
 
 cloudformation_template = begin
   pivnet_request(download_url).execute.body
@@ -229,9 +229,9 @@ rescue RestClient::RequestFailed => e
   if e.http_code == 451
     print 'accepting EULA for you... '
     accept_eula_href = JSON.parse(e.http_body)
-                           .fetch('_links')
-                           .fetch('eula_agreement')
-                           .fetch('href')
+      .fetch('_links')
+      .fetch('eula_agreement')
+      .fetch('href')
     pivnet_request(accept_eula_href, method: 'POST').execute
     print 'accepted '
     pivnet_request(download_url).execute.body
@@ -256,29 +256,29 @@ puts "creating AWS CF stack #{STACK_NAME}... "
 stack_create_duration = Duration.new
 cf_client = Aws::CloudFormation::Client.new
 response = cf_client.create_stack(
-    {
-        stack_name: STACK_NAME,
-        template_body: cloudformation_template,
-        parameters: [
-            {
-                parameter_key: '01NATKeyPair',
-                parameter_value: key_pair.key_name,
-            },
-            {
-                parameter_key: '05RdsUsername',
-                parameter_value: RDS_USERNAME,
-            },
-            {
-                parameter_key: '06RdsPassword',
-                parameter_value: RDS_PASSWORD,
-            },
-            {
-                parameter_key: '07SSLCertificateARN',
-                parameter_value: ssl_cert.arn,
-            }
-        ],
-        capabilities: %w(CAPABILITY_NAMED_IAM CAPABILITY_IAM)
-    }
+  {
+    stack_name: STACK_NAME,
+    template_body: cloudformation_template,
+    parameters: [
+      {
+        parameter_key: '01NATKeyPair',
+        parameter_value: key_pair.key_name,
+      },
+      {
+        parameter_key: '05RdsUsername',
+        parameter_value: RDS_USERNAME,
+      },
+      {
+        parameter_key: '06RdsPassword',
+        parameter_value: RDS_PASSWORD,
+      },
+      {
+        parameter_key: '07SSLCertificateARN',
+        parameter_value: ssl_cert.arn,
+      }
+    ],
+    capabilities: %w(CAPABILITY_NAMED_IAM CAPABILITY_IAM)
+  }
 )
 puts "=> creating #{response.stack_id}"
 
