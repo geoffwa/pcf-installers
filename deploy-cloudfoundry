@@ -172,7 +172,7 @@ response = cf_client.create_stack(
                 parameter_value: ssl_cert.arn,
             }
         ],
-        capabilities : %w(CAPABILITY_NAMED_IAM CAPABILITY_IAM)
+        capabilities: %w(CAPABILITY_NAMED_IAM CAPABILITY_IAM)
     }
 )
 puts "=> creating #{response.stack_id}"
