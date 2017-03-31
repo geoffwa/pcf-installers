@@ -11,6 +11,7 @@ require 'pry'
 require 'aws-sdk'
 require 'dotenv/load'
 require 'rest-client'
+require 'terminal-notifier'
 
 if File.file? "#{ENV['HOME']}/.aws/config"
   aws_config = IniFile.new(filename: "#{ENV['HOME']}/.aws/config", encoding: 'UTF-8')
@@ -214,5 +215,8 @@ cf_client.wait_until(:stack_create_complete) do |waiter|
 end
 
 stack_create_finish = Time.now
-puts "deployed PCF stack in #{formatted_duration(stack_create_finish - stack_create_start)}"
+duration = formatted_duration(stack_create_finish - stack_create_start)
+message = "deployment of #{STACK_NAME} to AWS finished in #{duration}"
+puts message
+TerminalNotifier.notify(message)
 
