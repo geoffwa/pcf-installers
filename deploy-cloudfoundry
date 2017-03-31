@@ -35,7 +35,6 @@ PCF_PIVNET_SLUG = 'elastic-runtime'
 PIVNET_TOKEN = ENV.fetch('PIVNET_TOKEN')
 RDS_USERNAME = ENV.fetch('RDS_USERNAME')
 RDS_PASSWORD = ENV.fetch('RDS_PASSWORD')
-MOBILE_NUMBER = ENV.fetch('MOBILE_NUMBER', false)
 STACK_NAME = ARGV[0]
 
 def formatted_duration total_seconds
